@@ -79,7 +79,8 @@ All endpoints below except login and health checks require `Authorization: Beare
 | `GET` | `/conflicts` | List detected topology conflicts |
 | `POST` | `/conflicts/detect` | Run detection; requires an `Idempotency-Key` header |
 | `POST` | `/conflicts/:id/transition` | Confirm, mark false positive, propose resolution, or close a conflict |
-| `POST` | `/conflicts/:id/apply-suggestion` | Create a new draft proposal from the reviewed suggestion and resolve the source conflict |
+| `POST` | `/conflicts/:id/review-suggestion` | Recheck the stored suggestion against the current parcels: area delta, snap moves, participant diff, and recomputed findings |
+| `POST` | `/conflicts/:id/apply-suggestion` | Apply the reviewed suggestion: requires the review `snapshot_hash`; creates a draft proposal and resolves the conflict only when the snapshot still matches and no residual conflict remains |
 | `GET` | `/audit` | Read immutable audit events |
 
 `/healthz` is liveness; `/readyz` verifies database readiness.
@@ -100,7 +101,7 @@ The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by
 
 The independent Gin middleware files are `request_id.go`, `recovery.go`, `auth.go`, `rbac.go`, `audit.go`, and `error_handler.go`. They establish request correlation and audit context before authentication, enforce authorization and rate limits, recover panics, and retain a uniform JSON fallback for recorded Gin errors.
 
-Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a reviewed suggestion creates a new draft proposal version and resolves the source conflict; it does not rewrite the original proposal or parcel boundary.
+Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a suggestion is a gated two-step review: `review-suggestion` recomputes the snapped boundary against the current parcel version and every current neighbouring parcel and returns the area delta, snap-move count, per-parcel snapshot diff, and recomputed findings; `apply-suggestion` then requires the reviewed `snapshot_hash` and only creates the new draft proposal version and resolves the source conflict when the detection snapshot still matches all participating parcels and no residual conflict (any recomputed finding other than the one being resolved) remains. Otherwise it returns `409` with the blocking parcels, conflict types, and magnitudes in `error.details` and keeps the conflict in `resolution_proposed`; it never rewrites the original proposal or parcel boundary.
 
 ## Coordinates And Legal Boundary
 
@@ -108,7 +109,7 @@ Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepte
 - Parcel boundaries must be closed, finite, non-self-intersecting `Polygon`s; observations must be finite `Point`s.
 - Only projected EPSG systems are accepted for meter calculations. `EPSG:4326`, `EPSG:4490`, and `EPSG:4269` are rejected so degrees are never used as meters.
 - Original geometry is kept. The deterministic suggestion prefers a matching reference vertex, then the nearest projection on a reference edge, and records every moved coordinate with its distance and target kind.
-- Detection stores tolerance, algorithm version, input hash, and immutable result IDs. `Idempotency-Key` is required (1-128 characters): replaying the same actor/key/request returns the stored result set, while reusing that key with a different detection request returns `409`.
+- Detection stores tolerance, algorithm version, input hash, a per-parcel participant snapshot, and immutable result IDs. `Idempotency-Key` is required (1-128 characters): replaying the same actor/key/request returns the stored result set, while reusing that key with a different detection request returns `409`.
 - No result is a legal boundary establishment, title decision, or registration action.
 
 ## Environment And Ports

@@ -61,7 +61,6 @@ func (s *CadastralService) DetectConflicts(req dto.DetectConflictRequest, idempo
 	}
 	neighbours := make([]geometry.ParcelReference, 0, len(neighbourModels))
 	references := []geometry.Polygon{base}
-	hashParts := []string{parcel.BoundaryGeoJSON, proposal.ProposedGeoJSON, parcel.CoordinateSystem, fmt.Sprintf("%.6f", tolerance), geometry.AlgorithmVersion}
 	for _, neighbour := range neighbourModels {
 		polygon, parseErr := geometry.ParsePolygon(neighbour.BoundaryGeoJSON)
 		if parseErr != nil {
@@ -69,7 +68,6 @@ func (s *CadastralService) DetectConflicts(req dto.DetectConflictRequest, idempo
 		}
 		neighbours = append(neighbours, geometry.ParcelReference{ID: neighbour.ID, Polygon: polygon})
 		references = append(references, polygon)
-		hashParts = append(hashParts, strconv.FormatUint(uint64(neighbour.ID), 10), neighbour.BoundaryGeoJSON)
 	}
 	sort.Slice(neighbours, func(i, j int) bool { return neighbours[i].ID < neighbours[j].ID })
 	snapped, snapErr := geometry.SnapToReferences(proposed, references, tolerance)
@@ -80,10 +78,11 @@ func (s *CadastralService) DetectConflicts(req dto.DetectConflictRequest, idempo
 	if detectErr != nil {
 		return nil, internal("detect topology conflicts failed", detectErr)
 	}
-	inputHash := geometry.Hash(hashParts...)
+	inputHash := detectionInputHash(parcel, proposal, neighbourModels, tolerance)
 	suggestedJSON, marshalErr := json.Marshal(map[string]any{
 		"action": "review_snapped_boundary", "snapped_geojson": json.RawMessage(snapped.SuggestedGeoJSON), "snap_changes": snapped.Changes,
 		"tolerance_m": tolerance, "coordinate_system": parcel.CoordinateSystem, "algorithm_version": geometry.AlgorithmVersion, "topology_input_hash": inputHash,
+		"participants": suggestionParticipants(parcel, neighbourModels),
 	})
 	if marshalErr != nil {
 		return nil, internal("encode topology suggestion failed", marshalErr)
@@ -183,6 +182,30 @@ func (s *CadastralService) TransitionConflict(id uint, req dto.ConflictTransitio
 	return item, nil
 }
 
+func (s *CadastralService) ReviewConflictSuggestion(id uint, actor Actor) (dto.SuggestionReview, error) {
+	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
+		return dto.SuggestionReview{}, err
+	}
+	item, err := s.store.Conflicts.Get(id)
+	if errors.Is(err, repository.ErrNotFound) {
+		return dto.SuggestionReview{}, notFound("conflict")
+	}
+	if err != nil {
+		return dto.SuggestionReview{}, internal("get conflict failed", err)
+	}
+	if item.ConflictState != constants.ConflictResolutionProposed {
+		return dto.SuggestionReview{}, conflict("a suggestion can only be reviewed from resolution_proposed", nil)
+	}
+	proposal, err := s.store.Proposals.Get(item.ProposalID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return dto.SuggestionReview{}, notFound("proposal")
+	}
+	if err != nil {
+		return dto.SuggestionReview{}, internal("load proposal failed", err)
+	}
+	return s.recheckSuggestion(item, proposal)
+}
+
 func (s *CadastralService) ApplyConflictSuggestion(id uint, req dto.ApplySuggestionRequest, actor Actor) (model.BoundaryProposal, error) {
 	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
 		return model.BoundaryProposal{}, err
@@ -204,11 +227,23 @@ func (s *CadastralService) ApplyConflictSuggestion(id uint, req dto.ApplySuggest
 	if err != nil {
 		return model.BoundaryProposal{}, internal("load proposal failed", err)
 	}
-	var suggestion struct {
-		SnappedGeoJSON json.RawMessage `json:"snapped_geojson"`
+	submittedHash := strings.TrimSpace(req.SnapshotHash)
+	if submittedHash == "" {
+		return model.BoundaryProposal{}, invalid("snapshot_hash is required; run the suggestion review before applying", nil)
 	}
-	if err := json.Unmarshal([]byte(item.SuggestedResolutionJSON), &suggestion); err != nil || len(suggestion.SnappedGeoJSON) == 0 {
-		return model.BoundaryProposal{}, conflict("the conflict has no usable snapped-boundary suggestion", err)
+	review, err := s.recheckSuggestion(item, proposal)
+	if err != nil {
+		return model.BoundaryProposal{}, err
+	}
+	if review.SnapshotHash != submittedHash {
+		return model.BoundaryProposal{}, withDetails(conflict("the reviewed snapshot is stale; run the suggestion review again", nil), review)
+	}
+	if !review.CanApply {
+		return model.BoundaryProposal{}, withDetails(conflict("the suggestion no longer matches the current parcels or leaves residual conflicts; the conflict stays resolution_proposed", nil), review)
+	}
+	suggestion, err := parseStoredSuggestion(item)
+	if err != nil {
+		return model.BoundaryProposal{}, err
 	}
 	polygon, parseErr := geometry.ParsePolygon(string(suggestion.SnappedGeoJSON))
 	if parseErr != nil {
@@ -241,12 +276,222 @@ func (s *CadastralService) ApplyConflictSuggestion(id uint, req dto.ApplySuggest
 		if auditErr := tx.Audits.Create(audit(actor, "proposal.created_from_conflict", "BoundaryProposal", derived.ID, &derived.ParcelID, "{}", snapshot(derived))); auditErr != nil {
 			return auditErr
 		}
-		return tx.Audits.Create(audit(actor, "conflict.suggestion_applied", "TopologyConflict", item.ID, &derived.ID, snapshot(item), snapshot(map[string]any{"conflict_state": constants.ConflictResolved, "proposal_id": derived.ID})))
+		return tx.Audits.Create(audit(actor, "conflict.suggestion_applied", "TopologyConflict", item.ID, &derived.ID, snapshot(item), snapshot(map[string]any{"conflict_state": constants.ConflictResolved, "proposal_id": derived.ID, "snapshot_hash": review.SnapshotHash})))
 	})
 	if err != nil {
 		return model.BoundaryProposal{}, wrapCadastral(err, "apply conflict suggestion failed")
 	}
 	return derived, nil
+}
+
+// recheckSuggestion re-verifies a stored snapped-boundary suggestion against
+// the current parcel version and every current neighbouring parcel. It reports
+// the area delta and snap-move count from the stored evidence, recomputes the
+// topology findings, and diffs the detection-time participant snapshot against
+// the live parcels so a reviewer can see exactly what would be applied.
+func (s *CadastralService) recheckSuggestion(item model.TopologyConflict, proposal model.BoundaryProposal) (dto.SuggestionReview, error) {
+	review := dto.SuggestionReview{
+		ConflictID: item.ID, ProposalID: proposal.ID, ParcelID: proposal.ParcelID, DetectionInputHash: item.InputHash,
+		SnapChanges: []geometry.SnapChange{}, Participants: []dto.SuggestionReviewParticipant{},
+		RecheckConflicts: []dto.SuggestionReviewConflict{}, ResidualConflicts: []dto.SuggestionReviewConflict{}, Blockers: []string{},
+	}
+	suggestion, err := parseStoredSuggestion(item)
+	if err != nil {
+		return review, err
+	}
+	polygon, parseErr := geometry.ParsePolygon(string(suggestion.SnappedGeoJSON))
+	if parseErr != nil {
+		return review, internal("stored suggested geometry is invalid", parseErr)
+	}
+	parcel, parcelErr := s.store.Parcels.Get(proposal.ParcelID)
+	if errors.Is(parcelErr, repository.ErrNotFound) {
+		return review, notFound("parcel")
+	}
+	if parcelErr != nil {
+		return review, internal("load parcel failed", parcelErr)
+	}
+	base, baseErr := geometry.ParsePolygon(parcel.BoundaryGeoJSON)
+	if baseErr != nil {
+		return review, geoInvalid(baseErr)
+	}
+	neighbourModels, neighbourErr := s.store.Parcels.ListActiveByCoordinateSystem(parcel.CoordinateSystem, parcel.ID)
+	if neighbourErr != nil {
+		return review, internal("load neighbouring parcels failed", neighbourErr)
+	}
+	neighbours := make([]geometry.ParcelReference, 0, len(neighbourModels))
+	for _, neighbour := range neighbourModels {
+		neighbourPolygon, neighbourParseErr := geometry.ParsePolygon(neighbour.BoundaryGeoJSON)
+		if neighbourParseErr != nil {
+			return review, internal(fmt.Sprintf("stored geometry for neighbouring parcel %d is invalid", neighbour.ID), neighbourParseErr)
+		}
+		neighbours = append(neighbours, geometry.ParcelReference{ID: neighbour.ID, Polygon: neighbourPolygon})
+	}
+	findings, detectErr := geometry.DetectTopology(base, polygon, neighbours, suggestion.ToleranceM)
+	if detectErr != nil {
+		return review, internal("recheck topology conflicts failed", detectErr)
+	}
+	review.AreaDeltaSquareM = polygon.Area - parcel.AreaSquareM
+	if suggestion.SnapChanges != nil {
+		review.SnapChanges = suggestion.SnapChanges
+	}
+	review.SnapChangeCount = len(suggestion.SnapChanges)
+	review.SnapshotHash = detectionInputHash(parcel, proposal, neighbourModels, suggestion.ToleranceM)
+	review.SnapshotMatches = review.SnapshotHash == item.InputHash
+	review.Participants, review.Blockers = diffSuggestionParticipants(suggestion, parcel, neighbourModels, review.SnapshotMatches)
+	selfKey, keyErr := conflictParticipantKey(item)
+	if keyErr != nil {
+		return review, internal("stored conflict participants are invalid", keyErr)
+	}
+	for _, finding := range findings {
+		participantIDs := uniqueSortedIDs(append([]uint{parcel.ID}, finding.ParcelIDs...))
+		entry := dto.SuggestionReviewConflict{
+			ConflictType: finding.ConflictType, MagnitudeSquareM: finding.Magnitude, ParcelIDs: participantIDs,
+			Explanation: finding.Explanation, Self: participantKey(finding.ConflictType, participantIDs) == selfKey,
+		}
+		review.RecheckConflicts = append(review.RecheckConflicts, entry)
+		if !entry.Self {
+			review.ResidualConflicts = append(review.ResidualConflicts, entry)
+			review.Blockers = append(review.Blockers, fmt.Sprintf("residual %s of %.2f remains with parcel(s) %s", entry.ConflictType, entry.MagnitudeSquareM, joinParcelIDs(entry.ParcelIDs)))
+		}
+	}
+	review.CanApply = review.SnapshotMatches && len(review.ResidualConflicts) == 0
+	return review, nil
+}
+
+// suggestionParticipant is the detection-time snapshot of one parcel the
+// topology inputs depended on. It lets a later recheck attribute a changed
+// input hash to specific parcels.
+type suggestionParticipant struct {
+	ParcelID        uint   `json:"parcel_id"`
+	ParcelCode      string `json:"parcel_code"`
+	BoundaryVersion uint   `json:"boundary_version"`
+	BoundaryHash    string `json:"boundary_hash"`
+}
+
+type storedSuggestion struct {
+	Action           string                  `json:"action"`
+	SnappedGeoJSON   json.RawMessage         `json:"snapped_geojson"`
+	SnapChanges      []geometry.SnapChange   `json:"snap_changes"`
+	ToleranceM       float64                 `json:"tolerance_m"`
+	CoordinateSystem string                  `json:"coordinate_system"`
+	AlgorithmVersion string                  `json:"algorithm_version"`
+	InputHash        string                  `json:"topology_input_hash"`
+	Participants     []suggestionParticipant `json:"participants"`
+}
+
+func parseStoredSuggestion(item model.TopologyConflict) (storedSuggestion, error) {
+	var suggestion storedSuggestion
+	if err := json.Unmarshal([]byte(item.SuggestedResolutionJSON), &suggestion); err != nil || len(suggestion.SnappedGeoJSON) == 0 {
+		return storedSuggestion{}, conflict("the conflict has no usable snapped-boundary suggestion", err)
+	}
+	return suggestion, nil
+}
+
+// detectionInputHash hashes exactly the inputs DetectConflicts used, in the
+// same order, so a recheck can prove the participating parcels are unchanged.
+func detectionInputHash(parcel model.LandParcel, proposal model.BoundaryProposal, neighbours []model.LandParcel, tolerance float64) string {
+	hashParts := []string{parcel.BoundaryGeoJSON, proposal.ProposedGeoJSON, parcel.CoordinateSystem, fmt.Sprintf("%.6f", tolerance), geometry.AlgorithmVersion}
+	for _, neighbour := range neighbours {
+		hashParts = append(hashParts, strconv.FormatUint(uint64(neighbour.ID), 10), neighbour.BoundaryGeoJSON)
+	}
+	return geometry.Hash(hashParts...)
+}
+
+func suggestionParticipants(parcel model.LandParcel, neighbours []model.LandParcel) []suggestionParticipant {
+	participants := make([]suggestionParticipant, 0, len(neighbours)+1)
+	participants = append(participants, suggestionParticipant{ParcelID: parcel.ID, ParcelCode: parcel.ParcelCode, BoundaryVersion: parcel.BoundaryVersion, BoundaryHash: geometry.Hash(parcel.BoundaryGeoJSON)})
+	for _, neighbour := range neighbours {
+		participants = append(participants, suggestionParticipant{ParcelID: neighbour.ID, ParcelCode: neighbour.ParcelCode, BoundaryVersion: neighbour.BoundaryVersion, BoundaryHash: geometry.Hash(neighbour.BoundaryGeoJSON)})
+	}
+	sort.Slice(participants, func(i, j int) bool { return participants[i].ParcelID < participants[j].ParcelID })
+	return participants
+}
+
+// diffSuggestionParticipants compares the detection-time participant manifest
+// with the live parcels and returns the per-parcel status list plus
+// human-readable blockers for every difference found.
+func diffSuggestionParticipants(suggestion storedSuggestion, parcel model.LandParcel, neighbours []model.LandParcel, snapshotMatches bool) ([]dto.SuggestionReviewParticipant, []string) {
+	current := suggestionParticipants(parcel, neighbours)
+	blockers := []string{}
+	if suggestion.CoordinateSystem != "" && suggestion.CoordinateSystem != parcel.CoordinateSystem {
+		blockers = append(blockers, fmt.Sprintf("parcel coordinate system changed from %s to %s since detection", suggestion.CoordinateSystem, parcel.CoordinateSystem))
+	}
+	if suggestion.AlgorithmVersion != "" && suggestion.AlgorithmVersion != geometry.AlgorithmVersion {
+		blockers = append(blockers, fmt.Sprintf("topology algorithm changed from %s to %s since detection", suggestion.AlgorithmVersion, geometry.AlgorithmVersion))
+	}
+	if len(suggestion.Participants) == 0 {
+		// Suggestions stored before participant tracking only carry the input
+		// hash: a match still proves the parcels, a mismatch cannot be
+		// attributed to specific parcels.
+		result := make([]dto.SuggestionReviewParticipant, 0, len(current))
+		status := "unchanged"
+		if !snapshotMatches {
+			status = "unverified"
+			blockers = append(blockers, "detection snapshot predates participant tracking; re-run detection to identify the changed parcels")
+		}
+		for _, participant := range current {
+			result = append(result, dto.SuggestionReviewParticipant{ParcelID: participant.ParcelID, ParcelCode: participant.ParcelCode, CurrentVersion: participant.BoundaryVersion, Status: status})
+		}
+		return result, blockers
+	}
+	storedByID := make(map[uint]suggestionParticipant, len(suggestion.Participants))
+	for _, participant := range suggestion.Participants {
+		storedByID[participant.ParcelID] = participant
+	}
+	result := make([]dto.SuggestionReviewParticipant, 0, len(current)+1)
+	for _, participant := range current {
+		recorded, ok := storedByID[participant.ParcelID]
+		if !ok {
+			result = append(result, dto.SuggestionReviewParticipant{ParcelID: participant.ParcelID, ParcelCode: participant.ParcelCode, CurrentVersion: participant.BoundaryVersion, Status: "added"})
+			blockers = append(blockers, fmt.Sprintf("parcel %s (#%d) is a new active neighbour outside the detection snapshot", participant.ParcelCode, participant.ParcelID))
+			continue
+		}
+		delete(storedByID, participant.ParcelID)
+		if recorded.BoundaryHash != participant.BoundaryHash || recorded.BoundaryVersion != participant.BoundaryVersion {
+			result = append(result, dto.SuggestionReviewParticipant{ParcelID: participant.ParcelID, ParcelCode: participant.ParcelCode, StoredVersion: recorded.BoundaryVersion, CurrentVersion: participant.BoundaryVersion, Status: "changed"})
+			blockers = append(blockers, fmt.Sprintf("parcel %s (#%d) boundary changed since detection (version %d -> %d)", participant.ParcelCode, participant.ParcelID, recorded.BoundaryVersion, participant.BoundaryVersion))
+			continue
+		}
+		result = append(result, dto.SuggestionReviewParticipant{ParcelID: participant.ParcelID, ParcelCode: participant.ParcelCode, StoredVersion: recorded.BoundaryVersion, CurrentVersion: participant.BoundaryVersion, Status: "unchanged"})
+	}
+	removed := make([]suggestionParticipant, 0, len(storedByID))
+	for _, recorded := range storedByID {
+		removed = append(removed, recorded)
+	}
+	sort.Slice(removed, func(i, j int) bool { return removed[i].ParcelID < removed[j].ParcelID })
+	for _, recorded := range removed {
+		result = append(result, dto.SuggestionReviewParticipant{ParcelID: recorded.ParcelID, ParcelCode: recorded.ParcelCode, StoredVersion: recorded.BoundaryVersion, Status: "removed"})
+		blockers = append(blockers, fmt.Sprintf("parcel %s (#%d) from the detection snapshot is no longer an active neighbour", recorded.ParcelCode, recorded.ParcelID))
+	}
+	return result, blockers
+}
+
+// conflictParticipantKey identifies the finding a conflict record represents
+// so the recheck can tell the conflict being resolved apart from residual
+// findings that would also apply to the snapped boundary.
+func conflictParticipantKey(item model.TopologyConflict) (string, error) {
+	var parcelIDs []uint
+	if err := json.Unmarshal([]byte(item.ParcelIDs), &parcelIDs); err != nil {
+		return "", err
+	}
+	return participantKey(string(item.ConflictType), parcelIDs), nil
+}
+
+func participantKey(conflictType string, parcelIDs []uint) string {
+	ids := uniqueSortedIDs(append([]uint{}, parcelIDs...))
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, strconv.FormatUint(uint64(id), 10))
+	}
+	return conflictType + "|" + strings.Join(parts, ",")
+}
+
+func joinParcelIDs(ids []uint) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, "#"+strconv.FormatUint(uint64(id), 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (s *CadastralService) replayDetectionRun(run model.TopologyDetectionRun, requestHash string) ([]model.TopologyConflict, error) {
@@ -274,7 +519,7 @@ func requireAnyRole(actor Actor, roles ...string) error {
 			return nil
 		}
 	}
-	return &AppError{CodeForbidden, http.StatusForbidden, "role is not permitted for this operation", nil}
+	return &AppError{Code: CodeForbidden, Status: http.StatusForbidden, Message: "role is not permitted for this operation"}
 }
 
 func conflictSeverity(kind string, magnitude, tolerance float64) string {
@@ -299,7 +544,7 @@ func uniqueSortedIDs(ids []uint) []uint {
 }
 
 func geoInvalid(err error) error {
-	return &AppError{CodeInvalidInput, http.StatusUnprocessableEntity, "geometry or coordinate system is invalid: " + err.Error(), err}
+	return &AppError{Code: CodeInvalidInput, Status: http.StatusUnprocessableEntity, Message: "geometry or coordinate system is invalid: " + err.Error(), Err: err}
 }
 
 func wrapCadastral(err error, message string) error {

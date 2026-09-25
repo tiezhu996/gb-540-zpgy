@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { topologyConflictApi, type ApplySuggestionInput, type ConflictDetectInput, type ConflictQuery, type ConflictTransitionInput } from '@/api/topology-conflict'
 import type { BoundaryProposal } from '@/types/boundary-proposal'
-import type { TopologyConflict } from '@/types/topology-conflict'
+import type { SuggestionReview, TopologyConflict } from '@/types/topology-conflict'
 
 export const useTopologyConflictStore = defineStore('topology-conflicts', () => {
   const items = ref<TopologyConflict[]>([])
@@ -33,8 +33,13 @@ export const useTopologyConflictStore = defineStore('topology-conflicts', () => 
     return data.data
   }
 
-  async function applySuggestion(id: number, body?: ApplySuggestionInput): Promise<BoundaryProposal> {
+  async function applySuggestion(id: number, body: ApplySuggestionInput): Promise<BoundaryProposal> {
     const { data } = await topologyConflictApi.applySuggestion(id, body)
+    return data.data
+  }
+
+  async function reviewSuggestion(id: number): Promise<SuggestionReview> {
+    const { data } = await topologyConflictApi.reviewSuggestion(id)
     return data.data
   }
 
@@ -43,5 +48,5 @@ export const useTopologyConflictStore = defineStore('topology-conflicts', () => 
     if (index >= 0) items.value[index] = item
   }
 
-  return { items, loading, fetch, detect, transition, applySuggestion }
+  return { items, loading, fetch, detect, transition, applySuggestion, reviewSuggestion }
 })

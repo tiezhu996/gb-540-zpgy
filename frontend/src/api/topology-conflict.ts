@@ -1,6 +1,6 @@
 import { api } from './client'
 import type { ApiEnvelope } from '@/types/api'
-import { normalizeTopologyConflict, type TopologyConflictWire } from '@/types/topology-conflict'
+import { normalizeTopologyConflict, type SuggestionReview, type TopologyConflictWire } from '@/types/topology-conflict'
 import type { BoundaryProposal } from '@/types/boundary-proposal'
 
 export interface ConflictQuery {
@@ -22,6 +22,7 @@ export interface ConflictTransitionInput {
 
 export interface ApplySuggestionInput {
   rationale?: string
+  snapshot_hash: string
 }
 
 function newIdempotencyKey() {
@@ -47,6 +48,10 @@ export const topologyConflictApi = {
     const response = await api.post<ApiEnvelope<TopologyConflictWire>>(`/conflicts/${id}/transition`, body)
     return { ...response, data: { ...response.data, data: normalizeTopologyConflict(response.data.data) } }
   },
-  applySuggestion: (id: number, body: ApplySuggestionInput = {}) =>
+  async reviewSuggestion(id: number) {
+    const response = await api.post<ApiEnvelope<SuggestionReview>>(`/conflicts/${id}/review-suggestion`)
+    return response
+  },
+  applySuggestion: (id: number, body: ApplySuggestionInput) =>
     api.post<ApiEnvelope<BoundaryProposal>>(`/conflicts/${id}/apply-suggestion`, body),
 }

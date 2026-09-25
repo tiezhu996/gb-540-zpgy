@@ -1,8 +1,10 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +159,31 @@ func TestCreateParcelRejectsSelfIntersectingGeometryWith422(t *testing.T) {
 	}
 }
 
+func detectTestConflicts(t *testing.T, svc *CadastralService, proposalID uint, key string) []model.TopologyConflict {
+	t.Helper()
+	found, err := svc.DetectConflicts(dto.DetectConflictRequest{ProposalID: proposalID, SnapToleranceM: 0.1}, key, testActor(701, constants.RoleGISAnalyst, "detect"))
+	if err != nil {
+		t.Fatalf("DetectConflicts() error = %v", err)
+	}
+	if len(found) == 0 {
+		t.Fatalf("DetectConflicts() returned no conflicts")
+	}
+	return found
+}
+
+func driveToResolutionProposed(t *testing.T, svc *CadastralService, id uint, reviewer Actor) model.TopologyConflict {
+	t.Helper()
+	item, err := svc.TransitionConflict(id, dto.ConflictTransitionRequest{To: constants.ConflictConfirmed}, reviewer)
+	if err != nil {
+		t.Fatalf("confirm conflict: %v", err)
+	}
+	item, err = svc.TransitionConflict(item.ID, dto.ConflictTransitionRequest{To: constants.ConflictResolutionProposed}, reviewer)
+	if err != nil {
+		t.Fatalf("propose resolution: %v", err)
+	}
+	return item
+}
+
 func TestSupersedingObservationRecordsReplacement(t *testing.T) {
 	svc, _ := newCadastralTestService(t)
 	actor := testActor(501, constants.RoleSurveyor, "observation-import")
@@ -192,5 +219,249 @@ func TestSupersedingObservationRecordsReplacement(t *testing.T) {
 	}
 	if persisted.Version != first.Version+1 || persisted.ReplacedBy == nil || *persisted.ReplacedBy != replacement.ID {
 		t.Fatalf("persisted observation = %#v, want incremented version and replacement", persisted)
+	}
+}
+
+func TestApplyConflictSuggestionRequiresReviewedSnapshot(t *testing.T) {
+	svc, _ := newCadastralTestService(t)
+	surveyor := testActor(701, constants.RoleSurveyor, "parcel-create")
+	base := createTestParcel(t, svc, "P-SNAP-BASE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), surveyor)
+	createTestParcel(t, svc, "P-SNAP-NEIGHBOR", serviceTestPolygon(`[10,0],[20,0],[20,10],[10,10],[10,0]`), surveyor)
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,10],[0,10],[0,0]`), surveyor)
+	found := detectTestConflicts(t, svc, proposal.ID, "snapshot-review-detect")
+	if len(found) != 1 {
+		t.Fatalf("detected %d conflicts, want 1", len(found))
+	}
+	reviewer := testActor(702, constants.RoleReviewer, "review")
+
+	var appErr *AppError
+	if _, err := svc.ReviewConflictSuggestion(found[0].ID, reviewer); !errors.As(err, &appErr) || appErr.Code != CodeConflict || appErr.Status != 409 {
+		t.Fatalf("review before resolution_proposed error = %v, want 409 %s", err, CodeConflict)
+	}
+	item := driveToResolutionProposed(t, svc, found[0].ID, reviewer)
+
+	if _, err := svc.ReviewConflictSuggestion(item.ID, testActor(703, constants.RoleSurveyor, "forbidden-review")); !errors.As(err, &appErr) || appErr.Code != CodeForbidden || appErr.Status != 403 {
+		t.Fatalf("surveyor review error = %v, want 403 %s", err, CodeForbidden)
+	}
+
+	review, err := svc.ReviewConflictSuggestion(item.ID, reviewer)
+	if err != nil {
+		t.Fatalf("ReviewConflictSuggestion() error = %v", err)
+	}
+	if !review.CanApply || !review.SnapshotMatches {
+		t.Fatalf("review = %+v, want applicable with a matching snapshot", review)
+	}
+	if review.AreaDeltaSquareM != 10 {
+		t.Fatalf("area delta = %v, want 10", review.AreaDeltaSquareM)
+	}
+	if review.SnapChangeCount != 0 || len(review.SnapChanges) != 0 {
+		t.Fatalf("snap changes = %d, want 0", review.SnapChangeCount)
+	}
+	if len(review.RecheckConflicts) != 1 || !review.RecheckConflicts[0].Self {
+		t.Fatalf("recheck conflicts = %+v, want the single self finding", review.RecheckConflicts)
+	}
+	if len(review.ResidualConflicts) != 0 {
+		t.Fatalf("residual conflicts = %+v, want none", review.ResidualConflicts)
+	}
+	if len(review.Participants) != 2 {
+		t.Fatalf("participants = %+v, want the base parcel and one neighbour", review.Participants)
+	}
+	for _, participant := range review.Participants {
+		if participant.Status != "unchanged" {
+			t.Fatalf("participant = %+v, want unchanged", participant)
+		}
+	}
+
+	if _, err := svc.ApplyConflictSuggestion(item.ID, dto.ApplySuggestionRequest{}, reviewer); !errors.As(err, &appErr) || appErr.Code != CodeInvalidInput || appErr.Status != 400 {
+		t.Fatalf("apply without snapshot hash error = %v, want 400 %s", err, CodeInvalidInput)
+	}
+	if _, err := svc.ApplyConflictSuggestion(item.ID, dto.ApplySuggestionRequest{SnapshotHash: strings.Repeat("0", 64)}, reviewer); !errors.As(err, &appErr) || appErr.Code != CodeConflict || appErr.Status != 409 {
+		t.Fatalf("apply with a stale snapshot error = %v, want 409 %s", err, CodeConflict)
+	}
+	persisted, err := svc.GetConflict(item.ID)
+	if err != nil {
+		t.Fatalf("reload conflict: %v", err)
+	}
+	if persisted.ConflictState != constants.ConflictResolutionProposed {
+		t.Fatalf("conflict state = %s, want resolution_proposed preserved", persisted.ConflictState)
+	}
+
+	derived, err := svc.ApplyConflictSuggestion(item.ID, dto.ApplySuggestionRequest{SnapshotHash: review.SnapshotHash}, reviewer)
+	if err != nil {
+		t.Fatalf("ApplyConflictSuggestion() error = %v", err)
+	}
+	if derived.ProposalState != constants.ProposalDraft || derived.ParcelID != base.ID || derived.Version != proposal.Version+1 {
+		t.Fatalf("derived proposal = %#v, want a new draft version", derived)
+	}
+	if derived.AreaDeltaSquareM != 10 {
+		t.Fatalf("derived area delta = %v, want 10", derived.AreaDeltaSquareM)
+	}
+	persisted, err = svc.GetConflict(item.ID)
+	if err != nil {
+		t.Fatalf("reload resolved conflict: %v", err)
+	}
+	if persisted.ConflictState != constants.ConflictResolved || persisted.ResolvedBy == nil || *persisted.ResolvedBy != reviewer.ID {
+		t.Fatalf("resolved conflict = %#v, want resolved by reviewer %d", persisted, reviewer.ID)
+	}
+}
+
+func TestApplyConflictSuggestionBlockedWhenParcelVersionChanges(t *testing.T) {
+	svc, _ := newCadastralTestService(t)
+	surveyor := testActor(711, constants.RoleSurveyor, "parcel-create")
+	base := createTestParcel(t, svc, "P-DRIFT-BASE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), surveyor)
+	createTestParcel(t, svc, "P-DRIFT-NEIGHBOR", serviceTestPolygon(`[10,0],[20,0],[20,10],[10,10],[10,0]`), surveyor)
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,10],[0,10],[0,0]`), surveyor)
+	found := detectTestConflicts(t, svc, proposal.ID, "parcel-drift-detect")
+	reviewer := testActor(712, constants.RoleReviewer, "review")
+	item := driveToResolutionProposed(t, svc, found[0].ID, reviewer)
+
+	newBoundary := serviceTestPolygon(`[0,0],[9.5,0],[9.5,10],[0,10],[0,0]`)
+	if _, err := svc.UpdateParcel(base.ID, dto.UpdateParcelRequest{BoundaryVersion: &base.BoundaryVersion, BoundaryGeoJSON: &newBoundary}, surveyor); err != nil {
+		t.Fatalf("UpdateParcel() error = %v", err)
+	}
+
+	review, err := svc.ReviewConflictSuggestion(item.ID, reviewer)
+	if err != nil {
+		t.Fatalf("ReviewConflictSuggestion() error = %v", err)
+	}
+	if review.SnapshotMatches || review.CanApply {
+		t.Fatalf("review = %+v, want a snapshot mismatch blocking the apply", review)
+	}
+	var baseStatus *dto.SuggestionReviewParticipant
+	for index := range review.Participants {
+		if review.Participants[index].ParcelID == base.ID {
+			baseStatus = &review.Participants[index]
+		}
+	}
+	if baseStatus == nil || baseStatus.Status != "changed" || baseStatus.StoredVersion != 1 || baseStatus.CurrentVersion != 2 {
+		t.Fatalf("participants = %+v, want the base parcel changed v1 -> v2", review.Participants)
+	}
+	if len(review.Blockers) == 0 {
+		t.Fatalf("blockers should name the changed parcel")
+	}
+
+	var appErr *AppError
+	if _, err := svc.ApplyConflictSuggestion(item.ID, dto.ApplySuggestionRequest{SnapshotHash: review.SnapshotHash}, reviewer); !errors.As(err, &appErr) || appErr.Code != CodeConflict || appErr.Status != 409 {
+		t.Fatalf("apply after parcel change error = %v, want 409 %s", err, CodeConflict)
+	}
+	details, ok := appErr.Details.(dto.SuggestionReview)
+	if !ok || details.CanApply {
+		t.Fatalf("error details = %#v, want the blocked suggestion review", appErr.Details)
+	}
+	persisted, err := svc.GetConflict(item.ID)
+	if err != nil {
+		t.Fatalf("reload conflict: %v", err)
+	}
+	if persisted.ConflictState != constants.ConflictResolutionProposed {
+		t.Fatalf("conflict state = %s, want resolution_proposed preserved", persisted.ConflictState)
+	}
+}
+
+func TestApplyConflictSuggestionBlockedWhenNeighbourAdded(t *testing.T) {
+	svc, _ := newCadastralTestService(t)
+	surveyor := testActor(721, constants.RoleSurveyor, "parcel-create")
+	base := createTestParcel(t, svc, "P-ADD-BASE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), surveyor)
+	createTestParcel(t, svc, "P-ADD-NEIGHBOR", serviceTestPolygon(`[10,0],[20,0],[20,10],[10,10],[10,0]`), surveyor)
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,10],[0,10],[0,0]`), surveyor)
+	found := detectTestConflicts(t, svc, proposal.ID, "neighbour-added-detect")
+	reviewer := testActor(722, constants.RoleReviewer, "review")
+	item := driveToResolutionProposed(t, svc, found[0].ID, reviewer)
+
+	added := createTestParcel(t, svc, "P-ADD-NEW", serviceTestPolygon(`[0,20],[10,20],[10,30],[0,30],[0,20]`), surveyor)
+	review, err := svc.ReviewConflictSuggestion(item.ID, reviewer)
+	if err != nil {
+		t.Fatalf("ReviewConflictSuggestion() error = %v", err)
+	}
+	if review.SnapshotMatches || review.CanApply {
+		t.Fatalf("review = %+v, want a snapshot mismatch blocking the apply", review)
+	}
+	var addedStatus *dto.SuggestionReviewParticipant
+	for index := range review.Participants {
+		if review.Participants[index].ParcelID == added.ID {
+			addedStatus = &review.Participants[index]
+		}
+	}
+	if addedStatus == nil || addedStatus.Status != "added" {
+		t.Fatalf("participants = %+v, want the new neighbour marked added", review.Participants)
+	}
+
+	var appErr *AppError
+	if _, err := svc.ApplyConflictSuggestion(item.ID, dto.ApplySuggestionRequest{SnapshotHash: review.SnapshotHash}, reviewer); !errors.As(err, &appErr) || appErr.Code != CodeConflict || appErr.Status != 409 {
+		t.Fatalf("apply after neighbour addition error = %v, want 409 %s", err, CodeConflict)
+	}
+	persisted, err := svc.GetConflict(item.ID)
+	if err != nil {
+		t.Fatalf("reload conflict: %v", err)
+	}
+	if persisted.ConflictState != constants.ConflictResolutionProposed {
+		t.Fatalf("conflict state = %s, want resolution_proposed preserved", persisted.ConflictState)
+	}
+}
+
+func TestApplyConflictSuggestionBlockedByResidualConflicts(t *testing.T) {
+	svc, _ := newCadastralTestService(t)
+	surveyor := testActor(731, constants.RoleSurveyor, "parcel-create")
+	base := createTestParcel(t, svc, "P-RESID-BASE", serviceTestPolygon(`[0,0],[10,0],[10,10],[0,10],[0,0]`), surveyor)
+	east := createTestParcel(t, svc, "P-RESID-EAST", serviceTestPolygon(`[10,0],[20,0],[20,10],[10,10],[10,0]`), surveyor)
+	north := createTestParcel(t, svc, "P-RESID-NORTH", serviceTestPolygon(`[0,10],[10,10],[10,20],[0,20],[0,10]`), surveyor)
+	proposal := createTestProposal(t, svc, base, serviceTestPolygon(`[0,0],[11,0],[11,11],[0,11],[0,0]`), surveyor)
+	found := detectTestConflicts(t, svc, proposal.ID, "residual-detect")
+	if len(found) != 2 {
+		t.Fatalf("detected %d conflicts, want 2", len(found))
+	}
+	reviewer := testActor(732, constants.RoleReviewer, "review")
+	var target model.TopologyConflict
+	for _, item := range found {
+		var ids []uint
+		if err := json.Unmarshal([]byte(item.ParcelIDs), &ids); err != nil {
+			t.Fatalf("parse participants: %v", err)
+		}
+		if len(ids) == 2 && ids[1] == east.ID {
+			target = item
+		}
+	}
+	if target.ID == 0 {
+		t.Fatalf("no conflict recorded for the east neighbour")
+	}
+	item := driveToResolutionProposed(t, svc, target.ID, reviewer)
+
+	review, err := svc.ReviewConflictSuggestion(item.ID, reviewer)
+	if err != nil {
+		t.Fatalf("ReviewConflictSuggestion() error = %v", err)
+	}
+	if !review.SnapshotMatches {
+		t.Fatalf("review = %+v, want a matching snapshot", review)
+	}
+	if review.CanApply {
+		t.Fatalf("review = %+v, want blocked by the residual overlap", review)
+	}
+	if len(review.RecheckConflicts) != 2 {
+		t.Fatalf("recheck conflicts = %+v, want both overlaps", review.RecheckConflicts)
+	}
+	if len(review.ResidualConflicts) != 1 {
+		t.Fatalf("residual conflicts = %+v, want the north overlap", review.ResidualConflicts)
+	}
+	residual := review.ResidualConflicts[0]
+	if residual.ConflictType != string(constants.ConflictOverlap) || residual.MagnitudeSquareM != 10 {
+		t.Fatalf("residual = %+v, want a 10 m² overlap", residual)
+	}
+	if len(residual.ParcelIDs) != 2 || residual.ParcelIDs[1] != north.ID {
+		t.Fatalf("residual parcels = %v, want the base and north parcel %d", residual.ParcelIDs, north.ID)
+	}
+
+	var appErr *AppError
+	if _, err := svc.ApplyConflictSuggestion(item.ID, dto.ApplySuggestionRequest{SnapshotHash: review.SnapshotHash}, reviewer); !errors.As(err, &appErr) || appErr.Code != CodeConflict || appErr.Status != 409 {
+		t.Fatalf("apply with residual conflicts error = %v, want 409 %s", err, CodeConflict)
+	}
+	details, ok := appErr.Details.(dto.SuggestionReview)
+	if !ok || len(details.ResidualConflicts) != 1 {
+		t.Fatalf("error details = %#v, want the residual review", appErr.Details)
+	}
+	persisted, err := svc.GetConflict(item.ID)
+	if err != nil {
+		t.Fatalf("reload conflict: %v", err)
+	}
+	if persisted.ConflictState != constants.ConflictResolutionProposed {
+		t.Fatalf("conflict state = %s, want resolution_proposed preserved", persisted.ConflictState)
 	}
 }

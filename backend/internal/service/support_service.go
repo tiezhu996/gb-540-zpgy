@@ -32,6 +32,9 @@ type AppError struct {
 	Status  int
 	Message string
 	Err     error
+	// Details carries a structured payload (for example a suggestion recheck)
+	// that the HTTP layer exposes as error.details when present.
+	Details any
 }
 
 func (e *AppError) Error() string {
@@ -44,19 +47,31 @@ func (e *AppError) Error() string {
 func (e *AppError) Unwrap() error { return e.Err }
 
 func invalid(message string, err error) error {
-	return &AppError{CodeInvalidInput, http.StatusBadRequest, message, err}
+	return &AppError{Code: CodeInvalidInput, Status: http.StatusBadRequest, Message: message, Err: err}
 }
 
 func notFound(resource string) error {
-	return &AppError{CodeNotFound, http.StatusNotFound, resource + " does not exist", repository.ErrNotFound}
+	return &AppError{Code: CodeNotFound, Status: http.StatusNotFound, Message: resource + " does not exist", Err: repository.ErrNotFound}
 }
 
 func conflict(message string, err error) error {
-	return &AppError{CodeConflict, http.StatusConflict, message, err}
+	return &AppError{Code: CodeConflict, Status: http.StatusConflict, Message: message, Err: err}
 }
 
 func internal(message string, err error) error {
-	return &AppError{CodeInternal, http.StatusInternalServerError, message, err}
+	return &AppError{Code: CodeInternal, Status: http.StatusInternalServerError, Message: message, Err: err}
+}
+
+// withDetails attaches a structured payload to an AppError without changing
+// its code, status, or message.
+func withDetails(err error, details any) error {
+	var appErr *AppError
+	if errors.As(err, &appErr) {
+		clone := *appErr
+		clone.Details = details
+		return &clone
+	}
+	return err
 }
 
 type Actor struct {
@@ -85,12 +100,12 @@ func (s *AuthService) Login(request dto.LoginRequest) (dto.LoginResponse, error)
 	user, err := s.store.Users.FindByUsername(request.Username)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
-			return dto.LoginResponse{}, &AppError{CodeUnauthorized, http.StatusUnauthorized, "username or password is incorrect", err}
+			return dto.LoginResponse{}, &AppError{Code: CodeUnauthorized, Status: http.StatusUnauthorized, Message: "username or password is incorrect", Err: err}
 		}
 		return dto.LoginResponse{}, internal("authentication lookup failed", err)
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(request.Password)); err != nil {
-		return dto.LoginResponse{}, &AppError{CodeUnauthorized, http.StatusUnauthorized, "username or password is incorrect", err}
+		return dto.LoginResponse{}, &AppError{Code: CodeUnauthorized, Status: http.StatusUnauthorized, Message: "username or password is incorrect", Err: err}
 	}
 	now, expires := time.Now(), time.Now().Add(s.ttl)
 	claims := Claims{UserID: user.ID, Username: user.Username, Role: user.Role, RegisteredClaims: jwt.RegisteredClaims{Subject: fmt.Sprint(user.ID), IssuedAt: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(expires), NotBefore: jwt.NewNumericDate(now)}}
@@ -109,15 +124,15 @@ func (s *AuthService) Parse(tokenString string) (Claims, error) {
 		return s.secret, nil
 	})
 	if err != nil || !token.Valid {
-		return Claims{}, &AppError{CodeUnauthorized, http.StatusUnauthorized, "access token is invalid or expired", err}
+		return Claims{}, &AppError{Code: CodeUnauthorized, Status: http.StatusUnauthorized, Message: "access token is invalid or expired", Err: err}
 	}
 	claims, ok := token.Claims.(*Claims)
 	if !ok {
-		return Claims{}, &AppError{CodeUnauthorized, http.StatusUnauthorized, "access token claims are invalid", nil}
+		return Claims{}, &AppError{Code: CodeUnauthorized, Status: http.StatusUnauthorized, Message: "access token claims are invalid", Err: nil}
 	}
 	user, err := s.store.Users.FindByID(claims.UserID)
 	if err != nil {
-		return Claims{}, &AppError{CodeUnauthorized, http.StatusUnauthorized, "account is inactive", err}
+		return Claims{}, &AppError{Code: CodeUnauthorized, Status: http.StatusUnauthorized, Message: "account is inactive", Err: err}
 	}
 	// Authorization follows the current account record, not role/name claims
 	// captured when an older token was issued.

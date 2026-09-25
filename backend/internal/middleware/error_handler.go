@@ -18,7 +18,11 @@ func ErrorHandlerMiddleware() gin.HandlerFunc {
 		}
 		var appErr *service.AppError
 		if errors.As(c.Errors.Last().Err, &appErr) {
-			c.AbortWithStatusJSON(appErr.Status, gin.H{"error": gin.H{"code": appErr.Code, "message": appErr.Message, "request_id": c.GetString("request_id")}})
+			payload := gin.H{"code": appErr.Code, "message": appErr.Message, "request_id": c.GetString("request_id")}
+			if appErr.Details != nil {
+				payload["details"] = appErr.Details
+			}
+			c.AbortWithStatusJSON(appErr.Status, gin.H{"error": payload})
 			return
 		}
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": service.CodeInternal, "message": "unexpected server error", "request_id": c.GetString("request_id")}})

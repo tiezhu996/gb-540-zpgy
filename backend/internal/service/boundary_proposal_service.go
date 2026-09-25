@@ -121,13 +121,13 @@ func authorizeProposalTransition(item model.BoundaryProposal, to constants.Propo
 		if isAuthor || actor.Role == constants.RoleAdmin {
 			return nil
 		}
-		return &AppError{CodeForbidden, http.StatusForbidden, "only the proposal author or an administrator may advance this authoring transition", nil}
+		return &AppError{Code: CodeForbidden, Status: http.StatusForbidden, Message: "only the proposal author or an administrator may advance this authoring transition"}
 	case constants.ProposalReviewed, constants.ProposalAccepted, constants.ProposalRejected, constants.ProposalRevision:
 		if actor.Role != constants.RoleReviewer && actor.Role != constants.RoleAdmin {
-			return &AppError{CodeForbidden, http.StatusForbidden, "only a reviewer or administrator may perform review transitions", nil}
+			return &AppError{Code: CodeForbidden, Status: http.StatusForbidden, Message: "only a reviewer or administrator may perform review transitions"}
 		}
 		if isAuthor {
-			return &AppError{CodeForbidden, http.StatusForbidden, "proposal author cannot review their own proposal", nil}
+			return &AppError{Code: CodeForbidden, Status: http.StatusForbidden, Message: "proposal author cannot review their own proposal"}
 		}
 		return nil
 	default:
