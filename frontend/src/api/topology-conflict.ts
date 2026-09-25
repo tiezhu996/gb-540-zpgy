@@ -1,6 +1,6 @@
 import { api } from './client'
 import type { ApiEnvelope } from '@/types/api'
-import { normalizeTopologyConflict, type TopologyConflictWire } from '@/types/topology-conflict'
+import { normalizeTopologyConflict, type RecheckParticipant, type SuggestionRecheck, type TopologyConflictWire } from '@/types/topology-conflict'
 import type { BoundaryProposal } from '@/types/boundary-proposal'
 
 export interface ConflictQuery {
@@ -22,6 +22,8 @@ export interface ConflictTransitionInput {
 
 export interface ApplySuggestionInput {
   rationale?: string
+  snapshot_hash: string
+  participants: RecheckParticipant[]
 }
 
 function newIdempotencyKey() {
@@ -47,6 +49,10 @@ export const topologyConflictApi = {
     const response = await api.post<ApiEnvelope<TopologyConflictWire>>(`/conflicts/${id}/transition`, body)
     return { ...response, data: { ...response.data, data: normalizeTopologyConflict(response.data.data) } }
   },
-  applySuggestion: (id: number, body: ApplySuggestionInput = {}) =>
+  async recheckSuggestion(id: number) {
+    const response = await api.post<ApiEnvelope<SuggestionRecheck>>(`/conflicts/${id}/recheck-suggestion`)
+    return response
+  },
+  applySuggestion: (id: number, body: ApplySuggestionInput) =>
     api.post<ApiEnvelope<BoundaryProposal>>(`/conflicts/${id}/apply-suggestion`, body),
 }

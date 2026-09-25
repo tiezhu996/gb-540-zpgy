@@ -59,6 +59,19 @@ func (h *CadastralHandler) TransitionConflict(c *gin.Context) {
 	ok(c, http.StatusOK, item, nil)
 }
 
+func (h *CadastralHandler) RecheckConflictSuggestion(c *gin.Context) {
+	id, valid := idParam(c)
+	if !valid {
+		return
+	}
+	recheck, err := h.service.RecheckConflictSuggestion(id, actor(c))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, http.StatusOK, recheck, nil)
+}
+
 func (h *CadastralHandler) ApplyConflictSuggestion(c *gin.Context) {
 	id, valid := idParam(c)
 	if !valid {

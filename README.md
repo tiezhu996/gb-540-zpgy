@@ -79,7 +79,8 @@ All endpoints below except login and health checks require `Authorization: Beare
 | `GET` | `/conflicts` | List detected topology conflicts |
 | `POST` | `/conflicts/detect` | Run detection; requires an `Idempotency-Key` header |
 | `POST` | `/conflicts/:id/transition` | Confirm, mark false positive, propose resolution, or close a conflict |
-| `POST` | `/conflicts/:id/apply-suggestion` | Create a new draft proposal from the reviewed suggestion and resolve the source conflict |
+| `POST` | `/conflicts/:id/recheck-suggestion` | Recompute the suggestion against the current parcel version and all neighbours; returns area delta, moved-coordinate count, residual conflicts, and a participant snapshot |
+| `POST` | `/conflicts/:id/apply-suggestion` | Create a draft proposal and resolve the conflict only when the submitted snapshot still matches the current participants and no residual conflicts remain; otherwise `409` keeps the state and names the parcels, conflict types, and magnitudes |
 | `GET` | `/audit` | Read immutable audit events |
 
 `/healthz` is liveness; `/readyz` verifies database readiness.
@@ -100,7 +101,7 @@ The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by
 
 The independent Gin middleware files are `request_id.go`, `recovery.go`, `auth.go`, `rbac.go`, `audit.go`, and `error_handler.go`. They establish request correlation and audit context before authentication, enforce authorization and rate limits, recover panics, and retain a uniform JSON fallback for recorded Gin errors.
 
-Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a reviewed suggestion creates a new draft proposal version and resolves the source conflict; it does not rewrite the original proposal or parcel boundary.
+Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a reviewed suggestion is a two-step review: `recheck-suggestion` recomputes the snapped boundary against the current parcel version and every active neighbour (area delta, moved coordinates, residual conflicts, participant snapshot) without writing anything, and `apply-suggestion` creates the new draft proposal version and resolves the source conflict only when the echoed snapshot still matches the current participants and the recalculated residual conflicts are empty. Parcel version or participant drift returns `409` with the changed parcels and residual conflict magnitudes, and the conflict keeps its previous state. Applying never rewrites the original proposal or parcel boundary.
 
 ## Coordinates And Legal Boundary
 
